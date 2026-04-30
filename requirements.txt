@@ -1,0 +1,5 @@
+kurigram
+TgCrypto
+requests
+bs4
+motor
