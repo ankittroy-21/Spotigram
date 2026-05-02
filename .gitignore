@@ -4,3 +4,5 @@ __pycache__/
 downloads/
 *_thumb.jpg
 *.mp3
+spotigram_session.session
+spotigram_session.session-journal
