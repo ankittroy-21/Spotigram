@@ -1,8 +1,12 @@
+"""
+Database configuration and user tracking for Spotigram.
+Uses Motor (async MongoDB driver) to securely store unique users and enforce rate limits.
+"""
+import time
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import MONGO_URI, DB_NAME
 
-# Setup basic logging to monitor the connections
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -20,7 +24,6 @@ class SpotigramDB:
         db = self.client[DB_NAME]
         self.users_collection = db["users"]
         
-        # Create a unique index so we never accidentally save the same user twice
         await self.users_collection.create_index("user_id", unique=True)
         logger.info(f"Database connected successfully: {DB_NAME}")
 
@@ -39,7 +42,7 @@ class SpotigramDB:
         return document is None
 
     async def register_user(self, user_id: int, first_name: str, username: str | None, dc_id: int | None):
-        """Adds a new user to the database using an upsert operation."""
+        """Adds a new user to the database."""
         if self.users_collection is None:
             return
             
@@ -51,10 +54,37 @@ class SpotigramDB:
                     "first_name": first_name,
                     "username": username,
                     "dc_id": dc_id,
+                    "last_used": 0.0  # Initialize timestamp
                 }
             },
             upsert=True,
         )
 
-# Create a single instance to be imported by our main bot file 
+    async def check_rate_limit(self, user_id: int, cooldown_seconds: int = 30) -> tuple[bool, int]:
+        """
+        Checks if the user is allowed to download based on the cooldown.
+        Returns (is_allowed, wait_time_remaining).
+        """
+        if self.users_collection is None:
+            return True, 0
+
+        user = await self.users_collection.find_one({"user_id": user_id}, {"last_used": 1})
+        current_time = time.time()
+
+        # If user isn't fully registered yet, let them pass but update time
+        if not user or "last_used" not in user:
+            await self.users_collection.update_one({"user_id": user_id}, {"$set": {"last_used": current_time}})
+            return True, 0
+
+        last_used = user.get("last_used", 0.0)
+        time_passed = current_time - last_used
+
+        if time_passed < cooldown_seconds:
+            wait_time = int(cooldown_seconds - time_passed)
+            return False, wait_time
+        
+        # If enough time has passed, update their timestamp to NOW
+        await self.users_collection.update_one({"user_id": user_id}, {"$set": {"last_used": current_time}})
+        return True, 0
+
 db = SpotigramDB()
