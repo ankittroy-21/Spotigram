@@ -4,6 +4,7 @@ Uses Motor (async MongoDB driver) to securely store unique users and enforce rat
 """
 import time
 import logging
+import certifi
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import MONGO_URI, DB_NAME
 
@@ -20,7 +21,7 @@ class SpotigramDB:
         if not MONGO_URI:
             raise ValueError("CRITICAL: MONGO_URI is missing from your .env file!")
         
-        self.client = AsyncIOMotorClient(MONGO_URI)
+        self.client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
         db = self.client[DB_NAME]
         self.users_collection = db["users"]
         
@@ -86,5 +87,26 @@ class SpotigramDB:
         # If enough time has passed, update their timestamp to NOW
         await self.users_collection.update_one({"user_id": user_id}, {"$set": {"last_used": current_time}})
         return True, 0
+    
+    async def get_total_users(self) -> int:
+        """Returns the total number of registered users."""
+        if self.users_collection is None:
+            return 0
+        return await self.users_collection.count_documents({})
+
+    async def get_active_users_24h(self) -> int:
+        """Returns the number of users who downloaded a track in the last 24 hours."""
+        if self.users_collection is None:
+            return 0
+        # Calculate the timestamp for exactly 24 hours ago
+        twenty_four_hours_ago = time.time() - (24 * 3600)
+        return await self.users_collection.count_documents({"last_used": {"$gte": twenty_four_hours_ago}})
+
+    async def get_all_user_ids(self) -> list[int]:
+        """Fetches every single user ID for the broadcast function."""
+        if self.users_collection is None:
+            return []
+        cursor = self.users_collection.find({}, {"user_id": 1})
+        return [doc["user_id"] for doc in await cursor.to_list(length=None)]
 
 db = SpotigramDB()
