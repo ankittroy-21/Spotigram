@@ -16,3 +16,8 @@ LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "0"))
 
 # Bot Username for UI branding
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SpotigramV2_bot")
+
+# Admin Configuration
+admin_env = os.getenv("ADMIN_IDS", "")
+# Convert the comma-separated string into a list of integers
+ADMIN_IDS = [int(x.strip()) for x in admin_env.split(",")] if admin_env else []
