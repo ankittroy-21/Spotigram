@@ -5,3 +5,4 @@ bs4
 motor
 python-dotenv
 certifi
+aiohttp
