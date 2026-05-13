@@ -44,7 +44,7 @@ async def upload_progress(current: int, total: int, status_msg: Message, start_t
         bar = "█" * filled_blocks + "▒" * (10 - filled_blocks)
         try:
             await status_msg.edit_text(
-                f"§ **Spotigram is working...**\n"
+                f"🤖 **Spotigram is working...**\n"
                 f"→ Uploading to Telegram\n"
                 f"※ `⟦{bar}⟧ {percentage:.1f}%`"
             )
@@ -107,18 +107,47 @@ async def handle_spotify_link(client: Client, message: Message):
         await message.reply_text("❌ Unsupported Spotify link type.")
 
 async def process_single_track(message: Message, url: str):
-    """Handles Phase 1 (Download) and Phase 2 (Upload) for a single track."""
+    """Handles Phase 1 (Download) and Phase 2 (Upload) with Zero-Download Caching."""
+    
+    # Strip Spotify tracking parameters so the cache key is always identical
+    clean_url = url.split("?")[0]
+    
     status_msg = await message.reply_text(
         "🤖 **Spotigram is working...**\n"
-        "📥 Fetching track from server\n"
-        "⏳ `[████▒▒▒▒▒▒] Processing...`"
+        "📥 Downloading track...\n"
+        "⏳ `[██▒▒▒▒▒▒▒▒] Processing...`"
     )
     
+    # --- ZERO-DOWNLOAD CACHE CHECK (Fast Path) ---
+    cached_file_id = await db.get_cached_track(clean_url)
+    if cached_file_id:
+        try:
+            await message.reply_audio(
+                audio=cached_file_id,
+                caption=(
+                    f"⚡ **Zero-Download Cache Hit**\n"
+                    f"🎵 *Delivered instantly by @{config.BOT_USERNAME}*"
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await status_msg.delete()
+            return  # Stop the function! Zero bandwidth used.
+        except Exception as e:
+            print(f"⚠️ Cache failed, falling back to download: {e}")
+    # ---------------------------------------------
+
+    # --- CACHE MISS (Slow Path) ---
+    await status_msg.edit_text(
+        "🤖 **Spotigram is working...**\n"
+        "📥 Downloading track...\n"
+        "⏳ `[██████▒▒▒▒] Please wait...`"
+    )
+
     local_path = thumb_path = None
     try:
         loop = asyncio.get_running_loop()
         file_name, title, artist, local_path, thumb_path = await loop.run_in_executor(
-            None, get_track, url
+            None, get_track, clean_url
         )
         
         file_size = get_file_size_mb(local_path)
@@ -129,8 +158,6 @@ async def process_single_track(message: Message, url: str):
         )
         
         start_time = time.time()
-        
-        # Added 'sent_msg =' so the log channel knows what to copy
         sent_msg = await message.reply_audio(
             audio=local_path,
             title=title,
@@ -142,6 +169,16 @@ async def process_single_track(message: Message, url: str):
             progress_args=(status_msg, start_time)
         )
         await status_msg.delete()
+
+        # --- SAVE TO CACHE FOR NEXT TIME ---
+        if sent_msg.audio:
+            # Save the URL key for single-track requests
+            await db.save_cached_track(clean_url, sent_msg.audio.file_id)
+            
+            # Save the Title-Artist key so Playlist downloads can find it too!
+            cache_key_composite = f"{title} - {artist}"
+            await db.save_cached_track(cache_key_composite, sent_msg.audio.file_id)
+        # -----------------------------------
 
         # Log Channel Copy
         if config.LOG_CHANNEL != 0:
@@ -163,8 +200,8 @@ async def process_playlist(message: Message, url: str):
     """Handles playlist processing asynchronously."""
     status_msg = await message.reply_text(
         "🤖 **Spotigram is working...**\n"
-        "• Initializing Playlist Download\n"
-        "⚠️ `⟦████▒▒▒▒▒▒⟧ Processing tracks...`"
+        "📥 Initializing Playlist Engine\n"
+        "⏳ `[██▒▒▒▒▒▒▒▒] Starting downloads...`"
     )
     
     completed = 0
@@ -190,44 +227,65 @@ async def process_playlist(message: Message, url: str):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: get_playlist_or_album(url, on_result_callback=on_track_result))
     except Exception as e:
-        await status_msg.edit_text(f"‼ **Something went wrong:**\n`{e}`")
+        await status_msg.edit_text(f"❌ **Something went wrong:**\n`{e}`")
 
 async def upload_playlist_track(message, status_msg, completed, failed, total, file_name, title, artist, local_path, thumb_path, error):
-    """Helper function to upload individual tracks from a playlist."""
+    """Helper function to upload individual tracks from a playlist with Caching."""
     if error:
-        pass # We still want to update the progress bar even if it fails
-    else:    
+        pass
+
         try:
-            file_size = get_file_size_mb(local_path)
-            caption = (
-                f"👤 **Artist:** {artist}\n"
-                f"💾 **Size:** {file_size} MB\n"
-                f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
-            )
+            # --- THE CACHE CHECK ---
+            cache_key = f"{title} - {artist}"
+            cached_file_id = await db.get_cached_track(cache_key)
             
-            # Save the message to a variable for the log channel
-            sent_msg = await message.reply_audio(
-                audio=local_path,
-                title=title,
-                performer=artist,
-                thumb=thumb_path,
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # Log Channel Copy for Playlists
-            if config.LOG_CHANNEL != 0:
-                try:
-                    await sent_msg.copy(
-                        chat_id=config.LOG_CHANNEL,
-                        caption=f"📁 **Archive (Playlist)**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
-                    )
-                except Exception as e:
-                    print(f"❌ Failed to copy playlist track to log channel: {e}")
+            if cached_file_id:
+                # ⚡ CACHE HIT: Send it instantly!
+                await message.reply_audio(
+                    audio=cached_file_id,
+                    caption=(
+                        f"👤 **Artist:** {artist}\n"
+                        f"⚡ **Zero-Download Cache Hit**\n"
+                        f"🎵 *Delivered via @{config.BOT_USERNAME}*"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                # 🐌 CACHE MISS: Upload it normally
+                file_size = get_file_size_mb(local_path)
+                caption = (
+                    f"👤 **Artist:** {artist}\n"
+                    f"💾 **Size:** {file_size} MB\n"
+                    f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
+                )
+                
+                sent_msg = await message.reply_audio(
+                    audio=local_path,
+                    title=title,
+                    performer=artist,
+                    thumb=thumb_path,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Save the new file to the database for the NEXT user!
+                if sent_msg.audio:
+                    await db.save_cached_track(cache_key, sent_msg.audio.file_id)
+                
+                # Log Channel Copy
+                if config.LOG_CHANNEL != 0:
+                    try:
+                        await sent_msg.copy(
+                            chat_id=config.LOG_CHANNEL,
+                            caption=f"📁 **Archive (Playlist)**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
+                        )
+                    except Exception as e:
+                        print(f"❌ Failed to log: {e}")
                     
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Playlist Upload Error: {e}")
         finally:
+            # Always clean up the server's hard drive!
             cleanup(local_path)
             cleanup(thumb_path)
 
@@ -256,7 +314,7 @@ async def upload_playlist_track(message, status_msg, completed, failed, total, f
 @app.on_message(filters.command("stats") & filters.user(config.ADMIN_IDS))
 async def cmd_stats(client: Client, message: Message):
     """Admin command to check database metrics."""
-    status_msg = await message.reply_text("§ Fetching system metrics...")
+    status_msg = await message.reply_text("⚠️ Fetching system metrics...")
     
     total_users = await db.get_total_users()
     active_24h = await db.get_active_users_24h()
@@ -313,7 +371,7 @@ async def start_bot():
     await db.connect()
     await app.start()
     print(f" System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
-    print(f"° Spotigram is now running. Waiting for messages...")
+    print(f" Spotigram is now running. Waiting for messages...")
     await idle()
     await app.stop()
     await db.disconnect()
