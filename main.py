@@ -4,6 +4,7 @@ Author: Ankit Roy
 Description: High-speed asynchronous bot to fetch and deliver Spotify audio with Zero-Download Caching.
 """
 import os
+from aiohttp import web
 import re
 import time
 import asyncio
@@ -341,7 +342,7 @@ async def upload_playlist_track(message, state, title, artist, local_path, thumb
     finally:
         cleanup(local_path)
         cleanup(thumb_path)
-        
+
 # --- Admin Commands ---
 
 @app.on_message(filters.command("stats") & filters.user(config.ADMIN_IDS))
@@ -397,8 +398,29 @@ async def cmd_broadcast(client: Client, message: Message):
     )
 
 # --- Entry Point ---
+
+async def keep_alive():
+    """A tiny dummy web server to trick cloud platforms into keeping the bot alive."""
+    async def handle(request):
+        return web.Response(text="🤖 Spotigram is successfully running in the cloud!")
+    
+    web_app = web.Application()
+    web_app.router.add_get('/', handle)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    
+    # Render automatically provides a PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Dummy web server listening on port {port}")
+
 async def start_bot():
     await db.connect()
+    
+    # Start the dummy web server BEFORE starting the bot
+    await keep_alive()
+    
     await app.start()
     print(f"✅ System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
     print(f"🤖 Spotigram is now running. Waiting for messages...")
