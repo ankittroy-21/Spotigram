@@ -1,7 +1,7 @@
 """
 Spotigram - Telegram Audio Bridge Controller
 Author: Ankit Roy
-Description: High-speed asynchronous bot to fetch and deliver Spotify audio.
+Description: High-speed asynchronous bot to fetch and deliver Spotify audio with Zero-Download Caching.
 """
 import os
 import re
@@ -45,8 +45,8 @@ async def upload_progress(current: int, total: int, status_msg: Message, start_t
         try:
             await status_msg.edit_text(
                 f"🤖 **Spotigram is working...**\n"
-                f"→ Uploading to Telegram\n"
-                f"※ `⟦{bar}⟧ {percentage:.1f}%`"
+                f"📤 Uploading to Telegram\n"
+                f"⏳ `[{bar}] {percentage:.1f}%`"
             )
         except Exception:
             pass 
@@ -70,7 +70,7 @@ async def cmd_start(client: Client, message: Message):
         await db.register_user(user.id, user.first_name, user.username, user.dc_id)
 
     welcome_text = (
-        "↪️ **Welcome to Spotigram** \n\n"
+        "🎧 **Welcome to Spotigram** \n\n"
         "I am your high-speed bridge between Spotify and Telegram. "
         "Send me any Spotify Track, Playlist, or Album link, and I'll fetch the original audio for you.\n\n"
         "**→** Just paste a link below to start."
@@ -114,7 +114,7 @@ async def process_single_track(message: Message, url: str):
     
     status_msg = await message.reply_text(
         "🤖 **Spotigram is working...**\n"
-        "📥 Downloading track...\n"
+        "📥 Checking cache...\n"
         "⏳ `[██▒▒▒▒▒▒▒▒] Processing...`"
     )
     
@@ -139,7 +139,7 @@ async def process_single_track(message: Message, url: str):
     # --- CACHE MISS (Slow Path) ---
     await status_msg.edit_text(
         "🤖 **Spotigram is working...**\n"
-        "📥 Downloading track...\n"
+        "📥 Downloading fresh track...\n"
         "⏳ `[██████▒▒▒▒] Please wait...`"
     )
 
@@ -197,118 +197,151 @@ async def process_single_track(message: Message, url: str):
         cleanup(thumb_path)
 
 async def process_playlist(message: Message, url: str):
-    """Handles playlist processing asynchronously."""
+    """Handles playlist processing asynchronously with a 5-second UI heartbeat."""
     status_msg = await message.reply_text(
         "🤖 **Spotigram is working...**\n"
         "📥 Initializing Playlist Engine\n"
-        "⏳ `[██▒▒▒▒▒▒▒▒] Starting downloads...`"
+        "⏳ `[▒▒▒▒▒▒▒▒▒▒] Starting...`"
     )
     
-    completed = 0
-    failed = 0
+    # 1. The Shared State Dictionary
+    state = {
+        "completed": 0,
+        "failed": 0,
+        "total": 0,
+        "is_running": True
+    }
+
+    # 2. The Background UI Heartbeat
+    async def ui_updater():
+        spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        idx = 0
+        while state["is_running"]:
+            await asyncio.sleep(5)  # Wait exactly 5 seconds!
+
+            if state["total"] > 0:
+                total_processed = state["completed"] + state["failed"]
+                bar_fill = int((total_processed / state["total"]) * 10)
+                bar = "█" * bar_fill + "▒" * (10 - bar_fill)
+                
+                text = (
+                    f"🤖 **Spotigram Playlist Engine** {spinner[idx % len(spinner)]}\n"
+                    f"✅ Success: {state['completed']} | ❌ Failed: {state['failed']} | 🎵 Total: {state['total']}\n"
+                    f"⏳ `[{bar}]`"
+                )
+                try:
+                    await status_msg.edit_text(text)
+                except FloodWait as e:
+                    await asyncio.sleep(e.value)
+                except Exception:
+                    pass
+            idx += 1
+
+    # Start the heartbeat loop in the background
+    updater_task = asyncio.create_task(ui_updater())
     main_loop = asyncio.get_event_loop()
 
     def on_track_result(index, total, file_name, title, artist, local_path, thumb_path, error):
-        nonlocal completed, failed
-        if error:
-            failed += 1
-        else:
-            completed += 1
-            
+        state["total"] = total  # Lock in the total track count
+        
         asyncio.run_coroutine_threadsafe(
             upload_playlist_track(
-                message, status_msg, completed, failed, total,
-                file_name, title, artist, local_path, thumb_path, error
+                message, state, title, artist, local_path, thumb_path, error
             ),
             loop=main_loop
         )
 
     try:
         loop = asyncio.get_running_loop()
+        # Fetch data from Spotify
         await loop.run_in_executor(None, lambda: get_playlist_or_album(url, on_result_callback=on_track_result))
+        
+        # 3. The Monitor: Keep this function alive until all uploads are physically finished
+        while True:
+            await asyncio.sleep(1)
+            if state["total"] > 0 and (state["completed"] + state["failed"]) >= state["total"]:
+                break
+                
     except Exception as e:
         await status_msg.edit_text(f"❌ **Something went wrong:**\n`{e}`")
-
-async def upload_playlist_track(message, status_msg, completed, failed, total, file_name, title, artist, local_path, thumb_path, error):
-    """Helper function to upload individual tracks from a playlist with Caching."""
-    if error:
-        pass
-
-        try:
-            # --- THE CACHE CHECK ---
-            cache_key = f"{title} - {artist}"
-            cached_file_id = await db.get_cached_track(cache_key)
-            
-            if cached_file_id:
-                # ⚡ CACHE HIT: Send it instantly!
-                await message.reply_audio(
-                    audio=cached_file_id,
-                    caption=(
-                        f"👤 **Artist:** {artist}\n"
-                        f"⚡ **Zero-Download Cache Hit**\n"
-                        f"🎵 *Delivered via @{config.BOT_USERNAME}*"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN
+    finally:
+        # 4. Shut down the heartbeat and print the final results!
+        state["is_running"] = False
+        updater_task.cancel()
+        
+        if state["total"] > 0:
+            try:
+                await status_msg.edit_text(
+                    f"🎉 **Playlist Download Complete!**\n"
+                    f"✅ Success: {state['completed']} | ❌ Failed: {state['failed']} | 🎵 Total: {state['total']}\n"
+                    f"※ *All requested tracks delivered.*"
                 )
-            else:
-                # 🐌 CACHE MISS: Upload it normally
-                file_size = get_file_size_mb(local_path)
-                caption = (
-                    f"👤 **Artist:** {artist}\n"
-                    f"💾 **Size:** {file_size} MB\n"
-                    f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
-                )
-                
-                sent_msg = await message.reply_audio(
-                    audio=local_path,
-                    title=title,
-                    performer=artist,
-                    thumb=thumb_path,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                # Save the new file to the database for the NEXT user!
-                if sent_msg.audio:
-                    await db.save_cached_track(cache_key, sent_msg.audio.file_id)
-                
-                # Log Channel Copy
-                if config.LOG_CHANNEL != 0:
-                    try:
-                        await sent_msg.copy(
-                            chat_id=config.LOG_CHANNEL,
-                            caption=f"📁 **Archive (Playlist)**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
-                        )
-                    except Exception as e:
-                        print(f"❌ Failed to log: {e}")
-                    
-        except Exception as e:
-            print(f"Playlist Upload Error: {e}")
-        finally:
-            # Always clean up the server's hard drive!
-            cleanup(local_path)
-            cleanup(thumb_path)
+            except Exception:
+                pass
 
-    # --- Progress Bar & Auto-Delete Logic ---
-    total_processed = completed + failed
+
+async def upload_playlist_track(message, state, title, artist, local_path, thumb_path, error):
+    """Helper function to upload tracks. (UI logic removed, only updates the State Dictionary)."""
     
-    if total_processed == total:
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-    else:
-        try:
-            bar_fill = int((total_processed) / total * 10)
-            bar = "█" * bar_fill + "▒" * (10 - bar_fill)
-            await status_msg.edit_text(
-                f"🤖 **Spotigram Playlist Progress**\n"
-                f"✅ Success: {completed} | ❌ Failed: {failed} | 🎵 Total: {total}\n"
-                f"⏳ `[{bar}]`"
-            )
-        except Exception:
-            pass
+    if error:
+        state["failed"] += 1
+        return
 
+    try:
+        # --- THE CACHE CHECK ---
+        cache_key = f"{title} - {artist}"
+        cached_file_id = await db.get_cached_track(cache_key)
+        
+        if cached_file_id:
+            await message.reply_audio(
+                audio=cached_file_id,
+                caption=(
+                    f"👤 **Artist:** {artist}\n"
+                    f"⚡ **Zero-Download Cache Hit**\n"
+                    f"🎵 *Delivered via @{config.BOT_USERNAME}*"
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # --- CACHE MISS ---
+            file_size = get_file_size_mb(local_path)
+            caption = (
+                f"👤 **Artist:** {artist}\n"
+                f"💾 **Size:** {file_size} MB\n"
+                f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
+            )
+            
+            sent_msg = await message.reply_audio(
+                audio=local_path,
+                title=title,
+                performer=artist,
+                thumb=thumb_path,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            if sent_msg.audio:
+                await db.save_cached_track(cache_key, sent_msg.audio.file_id)
+            
+            if config.LOG_CHANNEL != 0:
+                try:
+                    await sent_msg.copy(
+                        chat_id=config.LOG_CHANNEL,
+                        caption=f"📁 **Archive (Playlist)**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
+                    )
+                except Exception as e:
+                    print(f"❌ Failed to log: {e}")
+                    
+        # Successfully finished! Update the dictionary.
+        state["completed"] += 1
+                
+    except Exception as e:
+        print(f"Playlist Upload Error: {e}")
+        state["failed"] += 1
+    finally:
+        cleanup(local_path)
+        cleanup(thumb_path)
+        
 # --- Admin Commands ---
 
 @app.on_message(filters.command("stats") & filters.user(config.ADMIN_IDS))
@@ -320,9 +353,9 @@ async def cmd_stats(client: Client, message: Message):
     active_24h = await db.get_active_users_24h()
     
     stats_text = (
-        "🤖 **Spotigram Admin Panel** \n\n"
-        f"→ **Total Users:** {total_users}\n"
-        f"→ **Active (24h):** {active_24h}\n"
+        "📊 **Spotigram Admin Panel** \n\n"
+        f"👥 **Total Users:** {total_users}\n"
+        f"🔥 **Active (24h):** {active_24h}\n"
         "※ *System running optimally.*"
     )
     await status_msg.edit_text(stats_text)
@@ -330,20 +363,19 @@ async def cmd_stats(client: Client, message: Message):
 @app.on_message(filters.command("broadcast") & filters.user(config.ADMIN_IDS))
 async def cmd_broadcast(client: Client, message: Message):
     """Admin command to broadcast a message to all users."""
-    # To use this, the admin must reply to the message they want to broadcast with /broadcast
     if not message.reply_to_message:
         await message.reply_text("‼ **Usage Error:** You must reply to a message with `/broadcast` to send it.")
         return
 
     broadcast_msg = message.reply_to_message
-    status_msg = await message.reply_text("§ **Initializing Broadcast...**")
+    status_msg = await message.reply_text("📡 **Initializing Broadcast...**")
 
     user_ids = await db.get_all_user_ids()
     total = len(user_ids)
     successful = 0
     failed = 0
 
-    await status_msg.edit_text(f"§ **Broadcasting to {total} users...**\n*Please do not restart the bot.*")
+    await status_msg.edit_text(f"📡 **Broadcasting to {total} users...**\n*Please do not restart the bot.*")
 
     for user_id in user_ids:
         try:
@@ -351,27 +383,25 @@ async def cmd_broadcast(client: Client, message: Message):
             successful += 1
             await asyncio.sleep(0.1)  # Safe speed limit: 10 messages per second
         except FloodWait as e:
-            # If Telegram says we are too fast, wait the exact amount of time it asks for
             await asyncio.sleep(e.value)
             await broadcast_msg.copy(chat_id=user_id)
             successful += 1
         except Exception:
-            # This happens if a user blocked the bot or deleted their account
             failed += 1
 
     await status_msg.edit_text(
-        f" **Broadcast Complete** \n\n"
-        f"= **Successful:** {successful}\n"
-        f"− **Failed/Blocked:** {failed}\n"
-        f"※ **Total Reached:** {total}"
+        f"✅ **Broadcast Complete** \n\n"
+        f"✅ **Successful:** {successful}\n"
+        f"❌ **Failed/Blocked:** {failed}\n"
+        f"📊 **Total Reached:** {total}"
     )
 
 # --- Entry Point ---
 async def start_bot():
     await db.connect()
     await app.start()
-    print(f" System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
-    print(f" Spotigram is now running. Waiting for messages...")
+    print(f"✅ System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
+    print(f"🤖 Spotigram is now running. Waiting for messages...")
     await idle()
     await app.stop()
     await db.disconnect()
