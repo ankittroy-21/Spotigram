@@ -108,5 +108,32 @@ class SpotigramDB:
             return []
         cursor = self.users_collection.find({}, {"user_id": 1})
         return [doc["user_id"] for doc in await cursor.to_list(length=None)]
+    
+    async def get_cached_track(self, spotify_url: str) -> str | None:
+        """Checks if a track has already been downloaded and returns its Telegram File ID."""
+        if self.client is None:
+            return None
+        
+        db = self.client[DB_NAME]
+        cache_collection = db["track_cache"]
+        
+        document = await cache_collection.find_one({"spotify_url": spotify_url})
+        if document:
+            return document.get("telegram_file_id")
+        return None
+
+    async def save_cached_track(self, spotify_url: str, file_id: str):
+        """Saves a newly uploaded track's File ID to the database."""
+        if self.client is None:
+            return
+            
+        db = self.client[DB_NAME]
+        cache_collection = db["track_cache"]
+        
+        await cache_collection.update_one(
+            {"spotify_url": spotify_url},
+            {"$set": {"telegram_file_id": file_id}},
+            upsert=True
+        )
 
 db = SpotigramDB()
