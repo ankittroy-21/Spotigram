@@ -78,7 +78,7 @@ async def cmd_start(client: Client, message: Message):
     )
     await message.reply_text(welcome_text)
 
-@app.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
+@app.on_message(filters.text & filters.private & filters.regex(r"open\.spotify\.com"))
 async def handle_spotify_link(client: Client, message: Message):
     """Detects Spotify links and manages the download/upload pipeline."""
     text = message.text.strip()
@@ -86,7 +86,8 @@ async def handle_spotify_link(client: Client, message: Message):
     match = SPOTIFY_REGEX.search(text)
     
     if not match:
-        await message.reply_text("❌ That doesn't look like a valid Spotify link.")
+        # It only gets here if it has "open.spotify.com" but isn't a track/album/playlist (like a user profile link)
+        await message.reply_text("❌ That Spotify link format isn't supported. Please send a track, album, or playlist.")
         return
 
     # --- Rate Limit Check ---
@@ -104,8 +105,6 @@ async def handle_spotify_link(client: Client, message: Message):
         await process_single_track(message, url)
     elif "/playlist/" in url or "/album/" in url:
         await process_playlist(message, url)
-    else:
-        await message.reply_text("❌ Unsupported Spotify link type.")
 
 async def process_single_track(message: Message, url: str):
     """Handles Phase 1 (Download) and Phase 2 (Upload) with Zero-Download Caching."""
