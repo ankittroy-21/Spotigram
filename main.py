@@ -8,6 +8,7 @@ from aiohttp import web
 import re
 import time
 import asyncio
+from contextlib import suppress
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
@@ -36,21 +37,103 @@ def get_file_size_mb(file_path: str) -> float:
         return round(size_bytes / (1024 * 1024), 2)
     return 0.0
 
-async def upload_progress(current: int, total: int, status_msg: Message, start_time: float):
-    """Optimized progress bar that updates every 2 seconds to avoid Telegram limits."""
-    elapsed = time.time() - start_time
-    if int(elapsed) % 2 == 0:
-        percentage = current * 100 / total
-        filled_blocks = int(percentage / 10)
-        bar = "█" * filled_blocks + "▒" * (10 - filled_blocks)
-        try:
-            await status_msg.edit_text(
-                f"🤖 **Spotigram is working...**\n"
-                f"📤 Uploading to Telegram\n"
-                f"⏳ `[{bar}] {percentage:.1f}%`"
-            )
-        except Exception:
-            pass 
+def build_progress_bar(current: int, total: int, width: int = 10) -> tuple[str, float]:
+    """Builds a consistent progress bar and clamps the percentage safely."""
+    if total <= 0:
+        return ("▒" * width, 0.0)
+
+    percentage = max(0.0, min(100.0, (current * 100) / total))
+    filled_blocks = min(width, int((percentage / 100) * width))
+    return ("█" * filled_blocks + "▒" * (width - filled_blocks), percentage)
+
+
+def build_delivery_caption(title: str | None = None, artist: str | None = None) -> str:
+    """Returns a clean, backend-agnostic delivery caption."""
+    parts: list[str] = []
+
+    if title:
+        parts.append(f"🎵 **Title:** {title}")
+    if artist:
+        parts.append(f"👤 **Artist:** {artist}")
+
+    if not parts:
+        parts.append("🎵 **Spotify Audio**")
+
+    parts.append(f"📎 *Delivered via @{config.BOT_USERNAME}*")
+    return "\n".join(parts)
+
+
+async def upload_progress(current: int, total: int, status_msg: Message, start_time: float, progress_state: dict):
+    """Progress renderer for Telegram uploads with throttled edits."""
+    now = time.monotonic()
+    bar, percentage = build_progress_bar(current, total)
+
+    if (
+        current < total
+        and now - progress_state["last_edit"] < 3.0
+        and percentage - progress_state["last_percent"] < 10.0
+    ):
+        return
+
+    elapsed = max(0.1, now - start_time)
+    speed = current / elapsed if elapsed > 0 else 0.0
+
+    progress_state["last_edit"] = now
+    progress_state["last_percent"] = percentage
+
+    try:
+        await status_msg.edit_text(
+            f"🤖 **Spotigram is processing your audio**\n"
+            f"📤 Uploading to Telegram\n"
+            f"⏳ `[{bar}] {percentage:.1f}%`\n"
+            f"⚡ `Speed: {speed:.1f} units/s`"
+        )
+    except Exception:
+        pass
+
+
+async def render_playlist_status(status_msg: Message, state: dict, progress_state: dict, spinner: str):
+    """Keeps the playlist UI moving without exposing backend details."""
+    now = time.monotonic()
+    snapshot = (
+        state["completed"],
+        state["failed"],
+        state["total"],
+        state.get("active_title"),
+        state.get("active_artist"),
+    )
+
+    if now - progress_state["last_edit"] < 5.0 and snapshot == progress_state["last_snapshot"]:
+        return
+
+    progress_state["last_edit"] = now
+    progress_state["last_snapshot"] = snapshot
+
+    total = state["total"]
+    processed = state["completed"] + state["failed"]
+
+    if total > 0:
+        bar, percentage = build_progress_bar(processed, total)
+        text_lines = [
+            f"🤖 **Spotigram is processing your playlist** {spinner}",
+            f"✅ Done: {state['completed']} | ⚠️ Failed: {state['failed']} | 🎵 Total: {total}",
+            f"⏳ `[{bar}] {percentage:.1f}%`",
+        ]
+        if state.get("active_title") and state.get("active_artist"):
+            text_lines.append(f"🎧 Now handling: {state['active_title']} - {state['active_artist']}")
+    else:
+        text_lines = [
+            f"🤖 **Spotigram is preparing your playlist** {spinner}",
+            "🔎 Scanning tracks and building the queue...",
+            "⏳ `[▒▒▒▒▒▒▒▒▒▒] Waiting for tracks...`",
+        ]
+
+    try:
+        await status_msg.edit_text("\n".join(text_lines))
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception:
+        pass
 
 def cleanup(path: str | None):
     """Deletes temporary files after uploading."""
@@ -66,9 +149,11 @@ def cleanup(path: str | None):
 async def cmd_start(client: Client, message: Message):
     """Handles the /start command and logs the user."""
     user = message.from_user
+    if not user:
+        return
     
     if await db.is_new_user(user.id):
-        await db.register_user(user.id, user.first_name, user.username, user.dc_id)
+        await db.register_user(user.id, user.first_name, user.username, getattr(user, "dc_id", None))
 
     welcome_text = (
         "🎧 **Welcome to Spotigram** \n\n"
@@ -81,6 +166,9 @@ async def cmd_start(client: Client, message: Message):
 @app.on_message(filters.text & filters.private & filters.regex(r"open\.spotify\.com"))
 async def handle_spotify_link(client: Client, message: Message):
     """Detects Spotify links and manages the download/upload pipeline."""
+    if not message.from_user or not message.text:
+        return
+
     text = message.text.strip()
     
     match = SPOTIFY_REGEX.search(text)
@@ -107,15 +195,15 @@ async def handle_spotify_link(client: Client, message: Message):
         await process_playlist(message, url)
 
 async def process_single_track(message: Message, url: str):
-    """Handles Phase 1 (Download) and Phase 2 (Upload) with Zero-Download Caching."""
+    """Handles track delivery with a clean, backend-agnostic status flow."""
     
     # Strip Spotify tracking parameters so the cache key is always identical
     clean_url = url.split("?")[0]
     
     status_msg = await message.reply_text(
-        "🤖 **Spotigram is working...**\n"
-        "📥 Checking cache...\n"
-        "⏳ `[██▒▒▒▒▒▒▒▒] Processing...`"
+        "🤖 **Spotigram is preparing your audio**\n"
+        "🔎 Resolving track...\n"
+        "⏳ `[▒▒▒▒▒▒▒▒▒▒] Starting...`"
     )
     
     # --- ZERO-DOWNLOAD CACHE CHECK (Fast Path) ---
@@ -124,22 +212,19 @@ async def process_single_track(message: Message, url: str):
         try:
             await message.reply_audio(
                 audio=cached_file_id,
-                caption=(
-                    f"⚡ **Zero-Download Cache Hit**\n"
-                    f"🎵 *Delivered instantly by @{config.BOT_USERNAME}*"
-                ),
+                caption=build_delivery_caption(),
                 parse_mode=ParseMode.MARKDOWN
             )
             await status_msg.delete()
             return  # Stop the function! Zero bandwidth used.
         except Exception as e:
-            print(f"⚠️ Cache failed, falling back to download: {e}")
+            print(f"⚠️ Cached delivery failed, falling back to fresh upload: {e}")
     # ---------------------------------------------
 
     # --- CACHE MISS (Slow Path) ---
     await status_msg.edit_text(
-        "🤖 **Spotigram is working...**\n"
-        "📥 Downloading fresh track...\n"
+        "🤖 **Spotigram is preparing your audio**\n"
+        "📥 Fetching track...\n"
         "⏳ `[██████▒▒▒▒] Please wait...`"
     )
 
@@ -149,15 +234,14 @@ async def process_single_track(message: Message, url: str):
         file_name, title, artist, local_path, thumb_path = await loop.run_in_executor(
             None, get_track, clean_url
         )
+
+        if not local_path:
+            raise RuntimeError("Track download returned no file path")
         
-        file_size = get_file_size_mb(local_path)
-        caption = (
-            f"👤 **Artist:** {artist}\n"
-            f"💾 **Size:** {file_size} MB\n"
-            f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
-        )
+        caption = build_delivery_caption(title, artist)
         
         start_time = time.time()
+        progress_state = {"last_edit": 0.0, "last_percent": -1.0}
         sent_msg = await message.reply_audio(
             audio=local_path,
             title=title,
@@ -166,7 +250,7 @@ async def process_single_track(message: Message, url: str):
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
             progress=upload_progress,
-            progress_args=(status_msg, start_time)
+            progress_args=(status_msg, start_time, progress_state)
         )
         await status_msg.delete()
 
@@ -197,10 +281,10 @@ async def process_single_track(message: Message, url: str):
         cleanup(thumb_path)
 
 async def process_playlist(message: Message, url: str):
-    """Handles playlist processing asynchronously with a 5-second UI heartbeat."""
+    """Handles playlist processing with a throttled, always-moving UI heartbeat."""
     status_msg = await message.reply_text(
-        "🤖 **Spotigram is working...**\n"
-        "📥 Initializing Playlist Engine\n"
+        "🤖 **Spotigram is preparing your playlist**\n"
+        "🔎 Scanning tracks...\n"
         "⏳ `[▒▒▒▒▒▒▒▒▒▒] Starting...`"
     )
     
@@ -209,32 +293,19 @@ async def process_playlist(message: Message, url: str):
         "completed": 0,
         "failed": 0,
         "total": 0,
-        "is_running": True
+        "is_running": True,
+        "active_title": None,
+        "active_artist": None,
     }
 
     # 2. The Background UI Heartbeat
     async def ui_updater():
         spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         idx = 0
+        progress_state = {"last_edit": 0.0, "last_snapshot": None}
         while state["is_running"]:
-            await asyncio.sleep(5)  # Wait exactly 5 seconds!
-
-            if state["total"] > 0:
-                total_processed = state["completed"] + state["failed"]
-                bar_fill = int((total_processed / state["total"]) * 10)
-                bar = "█" * bar_fill + "▒" * (10 - bar_fill)
-                
-                text = (
-                    f"🤖 **Spotigram Playlist Engine** {spinner[idx % len(spinner)]}\n"
-                    f"✅ Success: {state['completed']} | ❌ Failed: {state['failed']} | 🎵 Total: {state['total']}\n"
-                    f"⏳ `[{bar}]`"
-                )
-                try:
-                    await status_msg.edit_text(text)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                except Exception:
-                    pass
+            await asyncio.sleep(5)
+            await render_playlist_status(status_msg, state, progress_state, spinner[idx % len(spinner)])
             idx += 1
 
     # Start the heartbeat loop in the background
@@ -243,6 +314,8 @@ async def process_playlist(message: Message, url: str):
 
     def on_track_result(index, total, file_name, title, artist, local_path, thumb_path, error):
         state["total"] = total  # Lock in the total track count
+        state["active_title"] = title
+        state["active_artist"] = artist
         
         asyncio.run_coroutine_threadsafe(
             upload_playlist_track(
@@ -272,9 +345,9 @@ async def process_playlist(message: Message, url: str):
         if state["total"] > 0:
             try:
                 await status_msg.edit_text(
-                    f"🎉 **Playlist Download Complete!**\n"
+                    f"🎉 **Playlist delivered successfully**\n"
                     f"✅ Success: {state['completed']} | ❌ Failed: {state['failed']} | 🎵 Total: {state['total']}\n"
-                    f"※ *All requested tracks delivered.*"
+                    f"※ *All requested tracks have been shared.*"
                 )
             except Exception:
                 pass
@@ -295,21 +368,15 @@ async def upload_playlist_track(message, state, title, artist, local_path, thumb
         if cached_file_id:
             await message.reply_audio(
                 audio=cached_file_id,
-                caption=(
-                    f"👤 **Artist:** {artist}\n"
-                    f"⚡ **Zero-Download Cache Hit**\n"
-                    f"🎵 *Delivered via @{config.BOT_USERNAME}*"
-                ),
+                caption=build_delivery_caption(title, artist),
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
             # --- CACHE MISS ---
-            file_size = get_file_size_mb(local_path)
-            caption = (
-                f"👤 **Artist:** {artist}\n"
-                f"💾 **Size:** {file_size} MB\n"
-                f"🎵 *Downloaded via @{config.BOT_USERNAME}*"
-            )
+            if not local_path:
+                raise RuntimeError("Playlist track download returned no file path")
+
+            caption = build_delivery_caption(title, artist)
             
             sent_msg = await message.reply_audio(
                 audio=local_path,
