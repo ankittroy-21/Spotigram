@@ -4,6 +4,7 @@ Author: Ankit Roy
 Description: High-speed asynchronous bot to fetch and deliver Spotify audio with Zero-Download Caching.
 """
 import os
+import io
 from aiohttp import web
 import re
 import time
@@ -30,12 +31,13 @@ app = Client(
 
 # --- Helper Functions ---
 
-def get_file_size_mb(file_path: str) -> float:
-    """Calculates file size in Megabytes."""
-    if file_path and os.path.exists(file_path):
-        size_bytes = os.path.getsize(file_path)
-        return round(size_bytes / (1024 * 1024), 2)
-    return 0.0
+def get_buffer_size_mb(audio_buf: io.BytesIO) -> float:
+    """Returns the size of a BytesIO buffer in MB without disturbing its position."""
+    pos = audio_buf.tell()
+    audio_buf.seek(0, 2)  # Seek to end
+    size_bytes = audio_buf.tell()
+    audio_buf.seek(pos)   # Restore original position
+    return round(size_bytes / (1024 * 1024), 2)
 
 def build_progress_bar(current: int, total: int, width: int = 10) -> tuple[str, float]:
     """Builds a consistent progress bar and clamps the percentage safely."""
@@ -136,7 +138,10 @@ async def render_playlist_status(status_msg: Message, state: dict, progress_stat
         pass
 
 def cleanup(path: str | None):
-    """Deletes temporary files after uploading."""
+    """
+    Deletes temporary thumbnail files after uploading.
+    Audio no longer touches disk, so this is only called for thumb paths now.
+    """
     try:
         if path and os.path.exists(path):
             os.remove(path)
@@ -174,7 +179,6 @@ async def handle_spotify_link(client: Client, message: Message):
     match = SPOTIFY_REGEX.search(text)
     
     if not match:
-        # It only gets here if it has "open.spotify.com" but isn't a track/album/playlist (like a user profile link)
         await message.reply_text("❌ That Spotify link format isn't supported. Please send a track, album, or playlist.")
         return
 
@@ -216,7 +220,7 @@ async def process_single_track(message: Message, url: str):
                 parse_mode=ParseMode.MARKDOWN
             )
             await status_msg.delete()
-            return  # Stop the function! Zero bandwidth used.
+            return  # Zero bandwidth used.
         except Exception as e:
             print(f"⚠️ Cached delivery failed, falling back to fresh upload: {e}")
     # ---------------------------------------------
@@ -228,22 +232,26 @@ async def process_single_track(message: Message, url: str):
         "⏳ `[██████▒▒▒▒] Please wait...`"
     )
 
-    local_path = thumb_path = None
+    # audio_buf is now a BytesIO object — no disk I/O
+    audio_buf = thumb_path = None
     try:
         loop = asyncio.get_running_loop()
-        file_name, title, artist, local_path, thumb_path = await loop.run_in_executor(
+        file_name, title, artist, audio_buf, thumb_path = await loop.run_in_executor(
             None, get_track, clean_url
         )
 
-        if not local_path:
-            raise RuntimeError("Track download returned no file path")
+        if not audio_buf:
+            raise RuntimeError("Track download returned no audio data")
         
+        # Give the BytesIO a filename hint so Telegram names the file correctly
+        audio_buf.name = f"{file_name}.mp3"
+
         caption = build_delivery_caption(title, artist)
         
         start_time = time.time()
         progress_state = {"last_edit": 0.0, "last_percent": -1.0}
         sent_msg = await message.reply_audio(
-            audio=local_path,
+            audio=audio_buf,
             title=title,
             performer=artist,
             thumb=thumb_path,
@@ -256,10 +264,7 @@ async def process_single_track(message: Message, url: str):
 
         # --- SAVE TO CACHE FOR NEXT TIME ---
         if sent_msg.audio:
-            # Save the URL key for single-track requests
             await db.save_cached_track(clean_url, sent_msg.audio.file_id)
-            
-            # Save the Title-Artist key so Playlist downloads can find it too!
             cache_key_composite = f"{title} - {artist}"
             await db.save_cached_track(cache_key_composite, sent_msg.audio.file_id)
         # -----------------------------------
@@ -277,7 +282,7 @@ async def process_single_track(message: Message, url: str):
     except Exception as e:
         await status_msg.edit_text(f"❌ **Something went wrong:**\n`{e}`")
     finally:
-        cleanup(local_path)
+        # Only thumbnails are on disk now
         cleanup(thumb_path)
 
 async def process_playlist(message: Message, url: str):
@@ -288,7 +293,6 @@ async def process_playlist(message: Message, url: str):
         "⏳ `[▒▒▒▒▒▒▒▒▒▒] Starting...`"
     )
     
-    # 1. The Shared State Dictionary
     state = {
         "completed": 0,
         "failed": 0,
@@ -298,7 +302,6 @@ async def process_playlist(message: Message, url: str):
         "active_artist": None,
     }
 
-    # 2. The Background UI Heartbeat
     async def ui_updater():
         spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         idx = 0
@@ -308,28 +311,25 @@ async def process_playlist(message: Message, url: str):
             await render_playlist_status(status_msg, state, progress_state, spinner[idx % len(spinner)])
             idx += 1
 
-    # Start the heartbeat loop in the background
     updater_task = asyncio.create_task(ui_updater())
     main_loop = asyncio.get_event_loop()
 
-    def on_track_result(index, total, file_name, title, artist, local_path, thumb_path, error):
-        state["total"] = total  # Lock in the total track count
+    def on_track_result(index, total, file_name, title, artist, audio_buf, thumb_path, error):
+        state["total"] = total
         state["active_title"] = title
         state["active_artist"] = artist
         
         asyncio.run_coroutine_threadsafe(
             upload_playlist_track(
-                message, state, title, artist, local_path, thumb_path, error
+                message, state, title, artist, audio_buf, thumb_path, error
             ),
             loop=main_loop
         )
 
     try:
         loop = asyncio.get_running_loop()
-        # Fetch data from Spotify
         await loop.run_in_executor(None, lambda: get_playlist_or_album(url, on_result_callback=on_track_result))
         
-        # 3. The Monitor: Keep this function alive until all uploads are physically finished
         while True:
             await asyncio.sleep(1)
             if state["total"] > 0 and (state["completed"] + state["failed"]) >= state["total"]:
@@ -338,7 +338,6 @@ async def process_playlist(message: Message, url: str):
     except Exception as e:
         await status_msg.edit_text(f"❌ **Something went wrong:**\n`{e}`")
     finally:
-        # 4. Shut down the heartbeat and print the final results!
         state["is_running"] = False
         updater_task.cancel()
         
@@ -353,15 +352,14 @@ async def process_playlist(message: Message, url: str):
                 pass
 
 
-async def upload_playlist_track(message, state, title, artist, local_path, thumb_path, error):
-    """Helper function to upload tracks. (UI logic removed, only updates the State Dictionary)."""
+async def upload_playlist_track(message, state, title, artist, audio_buf, thumb_path, error):
+    """Uploads a single playlist track. Accepts BytesIO for audio instead of a file path."""
     
     if error:
         state["failed"] += 1
         return
 
     try:
-        # --- THE CACHE CHECK ---
         cache_key = f"{title} - {artist}"
         cached_file_id = await db.get_cached_track(cache_key)
         
@@ -372,14 +370,15 @@ async def upload_playlist_track(message, state, title, artist, local_path, thumb
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            # --- CACHE MISS ---
-            if not local_path:
-                raise RuntimeError("Playlist track download returned no file path")
+            if not audio_buf:
+                raise RuntimeError("Playlist track download returned no audio data")
 
+            # Give the BytesIO a filename hint
+            audio_buf.name = f"{title} - {artist}.mp3"
             caption = build_delivery_caption(title, artist)
             
             sent_msg = await message.reply_audio(
-                audio=local_path,
+                audio=audio_buf,
                 title=title,
                 performer=artist,
                 thumb=thumb_path,
@@ -399,14 +398,13 @@ async def upload_playlist_track(message, state, title, artist, local_path, thumb
                 except Exception as e:
                     print(f"❌ Failed to log: {e}")
                     
-        # Successfully finished! Update the dictionary.
         state["completed"] += 1
                 
     except Exception as e:
         print(f"Playlist Upload Error: {e}")
         state["failed"] += 1
     finally:
-        cleanup(local_path)
+        # Only thumbnails are on disk now
         cleanup(thumb_path)
 
 # --- Admin Commands ---
@@ -475,7 +473,6 @@ async def keep_alive():
     runner = web.AppRunner(web_app)
     await runner.setup()
     
-    # Render automatically provides a PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
@@ -483,10 +480,7 @@ async def keep_alive():
 
 async def start_bot():
     await db.connect()
-    
-    # Start the dummy web server BEFORE starting the bot
     await keep_alive()
-    
     await app.start()
     print(f"✅ System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
     print(f"🤖 Spotigram is now running. Waiting for messages...")
