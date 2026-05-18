@@ -16,7 +16,12 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 import config
 from database import db
-from core.scraper import get_track, get_playlist_or_album
+import core.scraper as scraper
+import logging
+
+# Module logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Spotify Link Detector
 SPOTIFY_REGEX = re.compile(r"https?://open\.spotify\.com/(track|playlist|album)/[A-Za-z0-9]+")
@@ -90,8 +95,8 @@ async def upload_progress(current: int, total: int, status_msg: Message, start_t
             f"⏳ `[{bar}] {percentage:.1f}%`\n"
             f"⚡ `Speed: {speed:.1f} units/s`"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("upload_progress: failed to edit status message")
 
 
 async def render_playlist_status(status_msg: Message, state: dict, progress_state: dict, spinner: str):
@@ -134,8 +139,8 @@ async def render_playlist_status(status_msg: Message, state: dict, progress_stat
         await status_msg.edit_text("\n".join(text_lines))
     except FloodWait as e:
         await asyncio.sleep(e.value)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("render_playlist_status: failed to edit status message")
 
 def cleanup(path: str | None):
     """
@@ -145,8 +150,8 @@ def cleanup(path: str | None):
     try:
         if path and os.path.exists(path):
             os.remove(path)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("cleanup: failed to remove temporary file")
 
 # --- Bot Handlers ---
 
@@ -222,7 +227,7 @@ async def process_single_track(message: Message, url: str):
             await status_msg.delete()
             return  # Zero bandwidth used.
         except Exception as e:
-            print(f"⚠️ Cached delivery failed, falling back to fresh upload: {e}")
+            logger.warning("Cached delivery failed, falling back to fresh upload", exc_info=True)
     # ---------------------------------------------
 
     # --- CACHE MISS (Slow Path) ---
@@ -235,10 +240,7 @@ async def process_single_track(message: Message, url: str):
     # audio_buf is now a BytesIO object — no disk I/O
     audio_buf = thumb_path = None
     try:
-        loop = asyncio.get_running_loop()
-        file_name, title, artist, audio_buf, thumb_path = await loop.run_in_executor(
-            None, get_track, clean_url
-        )
+        file_name, title, artist, audio_buf, thumb_path = await scraper.get_track(clean_url)
 
         if not audio_buf:
             raise RuntimeError("Track download returned no audio data")
@@ -277,7 +279,7 @@ async def process_single_track(message: Message, url: str):
                     caption=f"📁 **Archive**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
                 )
             except Exception as e:
-                print(f"❌ Failed to copy to log channel: {e}")
+                logger.error("Failed to copy to log channel", exc_info=True)
 
     except Exception as e:
         await status_msg.edit_text(f"❌ **Something went wrong:**\n`{e}`")
@@ -312,23 +314,15 @@ async def process_playlist(message: Message, url: str):
             idx += 1
 
     updater_task = asyncio.create_task(ui_updater())
-    main_loop = asyncio.get_event_loop()
 
-    def on_track_result(index, total, file_name, title, artist, audio_buf, thumb_path, error):
+    async def on_track_result(index, total, file_name, title, artist, audio_buf, thumb_path, error):
         state["total"] = total
         state["active_title"] = title
         state["active_artist"] = artist
-        
-        asyncio.run_coroutine_threadsafe(
-            upload_playlist_track(
-                message, state, title, artist, audio_buf, thumb_path, error
-            ),
-            loop=main_loop
-        )
+        await upload_playlist_track(message, state, title, artist, audio_buf, thumb_path, error)
 
     try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: get_playlist_or_album(url, on_result_callback=on_track_result))
+        await scraper.get_playlist_or_album(url, on_result_callback=on_track_result)
         
         while True:
             await asyncio.sleep(1)
@@ -396,12 +390,12 @@ async def upload_playlist_track(message, state, title, artist, audio_buf, thumb_
                         caption=f"📁 **Archive (Playlist)**\n👤 User: {message.from_user.first_name} (`{message.from_user.id}`)\n{caption}"
                     )
                 except Exception as e:
-                    print(f"❌ Failed to log: {e}")
+                    logger.error("Failed to log playlist archive to channel", exc_info=True)
                     
         state["completed"] += 1
                 
     except Exception as e:
-        print(f"Playlist Upload Error: {e}")
+        logger.exception("Playlist upload error")
         state["failed"] += 1
     finally:
         # Only thumbnails are on disk now
@@ -476,16 +470,23 @@ async def keep_alive():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 Dummy web server listening on port {port}")
+    logger.info(f"🌐 Dummy web server listening on port {port}")
 
 async def start_bot():
     await db.connect()
     await keep_alive()
+    # Initialize async scraper session (persistent aiohttp ClientSession)
+    await scraper.init_session()
     await app.start()
-    print(f"✅ System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
-    print(f"🤖 Spotigram is now running. Waiting for messages...")
+    logger.info(f"✅ System Loaded - Admin IDs Recognized: {config.ADMIN_IDS}")
+    logger.info("🤖 Spotigram is now running. Waiting for messages...")
     await idle()
     await app.stop()
+    # Close scraper session and DB connection
+    try:
+        await scraper.close_session()
+    except Exception:
+        pass
     await db.disconnect()
 
 if __name__ == "__main__":
